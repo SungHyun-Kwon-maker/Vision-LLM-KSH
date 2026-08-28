@@ -85,6 +85,14 @@ class SignalObservation:
     scores: dict[str, float]
 
 
+@dataclass(frozen=True)
+class SceneObservation:
+    """All YOLO objects plus the traffic light selected for safety analysis."""
+
+    signal: SignalObservation
+    objects: tuple[dict[str, Any], ...]
+
+
 @dataclass
 class InteractionState:
     """Thread-safe status shared by the camera and STT/Gemma worker."""
@@ -565,16 +573,17 @@ def classify_signal_color(
     return best_state, scores
 
 
-def detect_signal(
+def detect_scene(
     frame: Any,
     detector: Any,
     args: argparse.Namespace,
-) -> SignalObservation:
+) -> SceneObservation:
+    """Run YOLO once, retain the full scene, and select one traffic light."""
     options: dict[str, Any] = {
         "source": frame,
         "conf": args.confidence,
         "iou": args.iou,
-        "classes": [TRAFFIC_LIGHT_CLASS_ID],
+        "classes": None,
         "imgsz": args.image_size,
         "verbose": False,
     }
@@ -584,18 +593,45 @@ def detect_signal(
     result = detector.predict(**options)[0]
     empty = {"red": 0.0, "yellow": 0.0, "green": 0.0}
     if result.boxes is None or len(result.boxes) == 0:
-        return SignalObservation(None, 0.0, "unknown", empty)
+        return SceneObservation(
+            SignalObservation(None, 0.0, "unknown", empty),
+            tuple(),
+        )
 
     height, width = frame.shape[:2]
     candidates: list[tuple[tuple[int, int, int, int], float]] = []
+    objects: list[dict[str, Any]] = []
     for box in result.boxes:
+        class_id = int(box.cls[0].item())
         confidence = float(box.conf[0].item())
         x1, y1, x2, y2 = box.xyxy[0].cpu().tolist()
         x1 = max(0, min(int(x1), width - 1))
         y1 = max(0, min(int(y1), height - 1))
         x2 = max(x1 + 1, min(int(x2), width))
         y2 = max(y1 + 1, min(int(y2), height))
-        candidates.append(((x1, y1, x2, y2), confidence))
+        bbox = (x1, y1, x2, y2)
+
+        if class_id == TRAFFIC_LIGHT_CLASS_ID:
+            candidates.append((bbox, confidence))
+
+        # Traffic lights use a deliberately low threshold because they are
+        # small. Other scene objects follow the 0.25 threshold used in the new
+        # cam-json-llm.py answer code to avoid noisy Gemma context.
+        if confidence >= args.scene_confidence or class_id == TRAFFIC_LIGHT_CLASS_ID:
+            objects.append(
+                {
+                    "class_id": class_id,
+                    "class": result.names[class_id],
+                    "confidence": round(confidence, 3),
+                    "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+                }
+            )
+
+    if not candidates:
+        return SceneObservation(
+            SignalObservation(None, 0.0, "unknown", empty),
+            tuple(objects),
+        )
 
     if args.signal_selection == "topmost":
         selected_box, confidence = min(candidates, key=lambda item: item[0][1])
@@ -616,53 +652,81 @@ def detect_signal(
         args.minimum_color_ratio,
         args.minimum_color_dominance,
     )
-    return SignalObservation(selected_box, confidence, raw_state, scores)
+    return SceneObservation(
+        SignalObservation(selected_box, confidence, raw_state, scores),
+        tuple(objects),
+    )
 
 
 def build_vision_context(
-    observation: SignalObservation,
+    scene: SceneObservation,
     stable_state: str,
     frame: Any,
 ) -> dict[str, Any]:
-    """Convert the selected YOLO result to the section-06 JSON structure."""
+    """Convert all YOLO results and the signal event to section-06 JSON."""
     height, width = frame.shape[:2]
-    objects: list[dict[str, Any]] = []
+    observation = scene.signal
+    objects = [
+        {
+            "class_id": obj["class_id"],
+            "class": obj["class"],
+            "confidence": obj["confidence"],
+            "bbox": dict(obj["bbox"]),
+        }
+        for obj in scene.objects
+    ]
+
+    selected_signal: dict[str, Any] | None = None
     if observation.box is not None:
         x1, y1, x2, y2 = observation.box
-        objects.append(
-            {
-                "class": "traffic light",
-                "confidence": round(observation.confidence, 3),
-                "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-                "raw_color_state": observation.raw_state,
-                "stable_color_state": stable_state,
-                "color_pixel_ratios": {
-                    key: round(value, 4)
-                    for key, value in observation.scores.items()
-                },
-            }
-        )
+        selected_signal = {
+            "class": "traffic light",
+            "confidence": round(observation.confidence, 3),
+            "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+            "raw_color_state": observation.raw_state,
+            "stable_color_state": stable_state,
+            "color_pixel_ratios": {
+                key: round(value, 4)
+                for key, value in observation.scores.items()
+            },
+        }
 
     return {
         "timestamp": time.time(),
         "image_width": width,
         "image_height": height,
         "objects": objects,
+        "selected_traffic_light": selected_signal,
     }
 
 
 def detections_to_text(vision_data: dict[str, Any]) -> str:
-    """Convert structured Vision JSON to a short LLM context sentence."""
+    """Convert full-frame YOLO JSON to the answer code's sentence template."""
     objects = vision_data.get("objects", [])
+    sentences: list[str] = []
     if not objects:
-        return "현재 탐지된 신호등이 없습니다."
+        sentences.append("현재 탐지된 객체가 없습니다.")
+    else:
+        for index, obj in enumerate(objects, start=1):
+            bbox = obj["bbox"]
+            sentences.append(
+                f"{index}번 객체는 {obj['class']}이며, "
+                f"confidence는 {obj['confidence']:.2f}이고, "
+                f"bbox는 ({bbox['x1']}, {bbox['y1']}, "
+                f"{bbox['x2']}, {bbox['y2']})입니다."
+            )
 
-    obj = objects[0]
-    return (
-        f"YOLO가 신호등을 confidence {obj['confidence']:.2f}로 탐지했습니다. "
-        f"HSV 단일 프레임 판정은 {obj['raw_color_state']}이고, "
-        f"다중 프레임 규칙 기반 안정 상태는 {obj['stable_color_state']}입니다."
-    )
+    signal = vision_data.get("selected_traffic_light")
+    if signal is None:
+        sentences.append("안전 이벤트 대상으로 선택된 신호등은 없습니다.")
+    else:
+        sentences.append(
+            f"선택된 신호등의 HSV 단일 프레임 판정은 "
+            f"{signal['raw_color_state']}이고, 다중 프레임 규칙 기반 "
+            f"안정 상태는 {signal['stable_color_state']}입니다."
+        )
+
+    return "\n".join(sentences)
 
 
 def save_vision_snapshot(
@@ -745,7 +809,7 @@ def start_interaction_worker(
 
 def draw_interface(
     frame: Any,
-    observation: SignalObservation,
+    scene: SceneObservation,
     stable_state: str,
     votes: int,
     fps: float,
@@ -754,6 +818,27 @@ def draw_interface(
     interaction_enabled: bool,
 ) -> Any:
     output = frame.copy()
+    observation = scene.signal
+
+    # Show the same full-frame object information used for JSON/Gemma context.
+    for obj in scene.objects:
+        bbox = obj["bbox"]
+        object_box = (bbox["x1"], bbox["y1"], bbox["x2"], bbox["y2"])
+        if observation.box is not None and object_box == observation.box:
+            continue
+        x1, y1, x2, y2 = object_box
+        cv2.rectangle(output, (x1, y1), (x2, y2), (160, 160, 160), 1)
+        cv2.putText(
+            output,
+            f"{obj['class']} {obj['confidence']:.2f}",
+            (x1, max(18, y1 - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (220, 220, 220),
+            1,
+            cv2.LINE_AA,
+        )
+
     if observation.box is not None:
         x1, y1, x2, y2 = observation.box
         color = STATE_COLORS[observation.raw_state]
@@ -779,6 +864,7 @@ def draw_interface(
     lines = [
         f"{voice_key}Q: quit | M: mute | R: repeat",
         f"Raw: {observation.raw_state} | Stable: {stable_state} | Votes: {votes}",
+        f"Scene objects in Context: {len(scene.objects)}",
         f"Color pixels: {score_text}",
         f"Interaction: {interaction_status}",
         f"TTS: {'MUTED' if muted else 'ON'} | FPS: {fps:.1f}",
@@ -867,6 +953,10 @@ def validate_arguments(args: argparse.Namespace) -> None:
         raise SystemExit("Stability window and votes must be at least 1.")
     if args.stability_votes > args.stability_window:
         raise SystemExit("--stability-votes cannot exceed --stability-window.")
+    if not 0.0 <= args.confidence <= 1.0:
+        raise SystemExit("--confidence must be between 0 and 1.")
+    if not 0.0 <= args.scene_confidence <= 1.0:
+        raise SystemExit("--scene-confidence must be between 0 and 1.")
     if not 0.0 <= args.minimum_color_ratio <= 1.0:
         raise SystemExit("--minimum-color-ratio must be between 0 and 1.")
     if not 0.0 <= args.minimum_color_dominance <= 1.0:
@@ -937,11 +1027,14 @@ def run(args: argparse.Namespace) -> None:
 
     stable_state = "unknown"
     stable_votes = 0
-    last_observation = SignalObservation(
-        None,
-        0.0,
-        "unknown",
-        {"red": 0.0, "yellow": 0.0, "green": 0.0},
+    last_scene = SceneObservation(
+        SignalObservation(
+            None,
+            0.0,
+            "unknown",
+            {"red": 0.0, "yellow": 0.0, "green": 0.0},
+        ),
+        tuple(),
     )
     displayed_fps = 0.0
     last_announced_state: str | None = None
@@ -973,14 +1066,16 @@ def run(args: argparse.Namespace) -> None:
             interaction_snapshot = interaction.snapshot()
             if not interaction_snapshot["gemma_busy"]:
                 with gpu_lock:
-                    observation = detect_signal(frame, detector, args)
-                last_observation = observation
+                    scene = detect_scene(frame, detector, args)
+                last_scene = scene
+                observation = scene.signal
                 stable_state, changed, stable_votes = signal_filter.update(
                     observation.raw_state
                 )
             else:
                 # Continue displaying camera frames while the shared GPU runs Gemma.
-                observation = last_observation
+                scene = last_scene
+                observation = scene.signal
                 changed = False
 
             if (
@@ -1010,7 +1105,7 @@ def run(args: argparse.Namespace) -> None:
 
             output = draw_interface(
                 frame,
-                observation,
+                scene,
                 stable_state,
                 stable_votes,
                 displayed_fps,
@@ -1050,7 +1145,7 @@ def run(args: argparse.Namespace) -> None:
                     continue
 
                 vision_data = build_vision_context(
-                    observation,
+                    scene,
                     stable_state,
                     frame,
                 )
@@ -1105,6 +1200,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--confidence", type=float, default=0.015)
+    parser.add_argument(
+        "--scene-confidence",
+        type=float,
+        default=0.25,
+        help="Minimum confidence for non-traffic-light objects in Gemma Context.",
+    )
     parser.add_argument("--iou", type=float, default=0.5)
     parser.add_argument("--image-size", type=int, default=640)
     parser.add_argument(
@@ -1169,4 +1270,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
