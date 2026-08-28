@@ -1,4 +1,3 @@
-```python
 # [ANSWER] 카메라 프레임 전체 화면의 YOLO 탐지 결과를 Dictionary → JSON → Natural Language → Gemma 순서로 전달
 
 import cv2
@@ -174,4 +173,3 @@ while True:
 
 cap.release()
 cv2.destroyAllWindows()
-```

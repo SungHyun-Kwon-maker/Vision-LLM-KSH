@@ -116,8 +116,6 @@ def describe_detections(llm, vision_text):
                 "role": "system",
                 "content": (
                     "주어진 객체 탐지 정보를 바탕으로 현재 상황을 설명하시오. "
-                    "탐지 결과에 없는 객체를 추측하지 마시오. "
-                    "한국어 두 문장 이내로 답하시오."
                 ),
             },
             {
@@ -126,7 +124,7 @@ def describe_detections(llm, vision_text):
             },
         ],
         max_tokens=MAX_TOKENS,
-        temperature=0.7,
+        temperature=0.0,
     )
     return response["choices"][0]["message"]["content"]
 

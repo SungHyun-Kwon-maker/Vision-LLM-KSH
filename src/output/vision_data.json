@@ -1,0 +1,16 @@
+{
+    "image_width": 1280,
+    "image_height": 720,
+    "objects": [
+        {
+            "class": "traffic light",
+            "confidence": 0.617,
+            "bbox": {
+                "x1": 70,
+                "y1": 148,
+                "x2": 1224,
+                "y2": 710
+            }
+        }
+    ]
+}
